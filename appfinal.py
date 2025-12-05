@@ -194,8 +194,8 @@ class App(tk.Tk):
         ttk.Label(sec, text="to", style="ToolLabel.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
         ttk.Entry(sec, textvariable=self.qmax_var, width=8).grid(row=0, column=3, sticky="w", padx=(0, 12), pady=4)
         ttk.Label(sec, text="Algorithm", style="ToolLabel.TLabel").grid(row=0, column=4, sticky="w", padx=(0, 6), pady=4)
-        self.method_var = tk.StringVar(value="FFT Powering")
-        ttk.Combobox(sec, textvariable=self.method_var, values=["FFT Powering", "Moment Matching"], width=18, state="readonly").grid(row=0, column=5, sticky="ew", pady=4)
+        self.method_var = tk.StringVar(value="Convolution")
+        ttk.Combobox(sec, textvariable=self.method_var, values=["Convolution", "FFT Powering", "Moment Matching"], width=18, state="readonly").grid(row=0, column=5, sticky="ew", pady=4)
         ttk.Button(sec, text="Compute Distribution", width=BTN_W_WIDE, command=self.action_compute).grid(row=1, column=5, sticky="e", pady=(6, 2))
 
     def _build_tabs(self, parent: ttk.Frame) -> None:
@@ -252,8 +252,103 @@ class App(tk.Tk):
             rows.append(row)
         return rows
 
+    # ===== Convolution Algorithm (Exact) =====
+    def _convolve(self, p: Dict[int, float], q: Dict[int, float]) -> Dict[int, float]:
+        """Discrete convolution of two PMFs p, q given as {charge: prob} dicts."""
+        from collections import defaultdict
+        r = defaultdict(float)
+        for a, pa in p.items():
+            for b, pb in q.items():
+                r[a + b] += pa * pb
+        return dict(r)
 
-    
+    def _power_pmf(self, p: Dict[int, float], n: int) -> Dict[int, float]:
+        """n-fold self-convolution of PMF p using exponentiation-by-squaring."""
+        if n == 0:
+            return {0: 1.0}
+        result = {0: 1.0}
+        base = p.copy()
+        k = n
+        while k > 0:
+            if k & 1:
+                result = self._convolve(result, base)
+            base = self._convolve(base, base)
+            k //= 2
+        return result
+
+    def _convolution_exact(self, qmin: int, qmax: int) -> Tuple[List[Tuple[int, float]], float, float, float, float]:
+        """
+        Exact convolution-based charge distribution computation.
+        Returns: (pmf list[(q,p)], mu, var, sigma, coverage_in_window)
+        """
+        rows = self._collect_table_rows()
+        charges = list(self.charge_cols)
+        
+        # Start with identity (spike at 0)
+        total_pmf = {0: 1.0}
+        
+        # Convolve each site's contribution
+        for r in rows:
+            # Gather probabilities in charge order
+            probs = [max(0.0, float(r.get(str(c), 0.0))) for c in charges]
+            s = sum(probs)
+            if s <= 0.0:
+                # Default to spike at 0 if present, else uniform
+                probs = [1.0 if c == 0 else 0.0 for c in charges]
+                s = 1.0
+            probs = [p / s for p in probs]
+            
+            # Build base PMF for this site
+            base_pmf = {c: p for c, p in zip(charges, probs)}
+            
+            # Raise to power (copies)
+            copies = max(1, int(r.get("Copies", 1)))
+            site_pmf = self._power_pmf(base_pmf, copies)
+            
+            # Convolve into total
+            total_pmf = self._convolve(total_pmf, site_pmf)
+        
+        # Normalize defensively
+        total_sum = sum(total_pmf.values())
+        if total_sum > 0 and abs(total_sum - 1.0) > 1e-12:
+            total_pmf = {k: v / total_sum for k, v in total_pmf.items()}
+        
+        # Compute statistics from full PMF
+        all_charges = sorted(total_pmf.keys())
+        mu = sum(q * total_pmf[q] for q in all_charges)
+        var = sum((q - mu) ** 2 * total_pmf[q] for q in all_charges)
+        sigma = math.sqrt(var) if var > 0 else 0.0
+        
+        # Apply windowing
+        if qmin >= qmax:
+            # Auto-determine window
+            if len(all_charges) > 0:
+                qmin = min(all_charges)
+                qmax = max(all_charges)
+            else:
+                qmin, qmax = -2, 2
+        
+        # Window the PMF and compute coverage
+        windowed_pmf: List[Tuple[int, float]] = []
+        coverage = 0.0
+        
+        for q in range(qmin, qmax + 1):
+            prob = total_pmf.get(q, 0.0)
+            # Aggregate tails into edge bins
+            if q == qmin:
+                # Add all probability from below qmin
+                prob += sum(total_pmf.get(c, 0.0) for c in all_charges if c < qmin)
+            if q == qmax:
+                # Add all probability from above qmax
+                prob += sum(total_pmf.get(c, 0.0) for c in all_charges if c > qmax)
+            windowed_pmf.append((q, prob))
+            coverage += prob
+        
+        # Renormalize windowed PMF
+        if coverage > 0 and abs(coverage - 1.0) > 1e-12:
+            windowed_pmf = [(q, p / coverage) for q, p in windowed_pmf]
+        
+        return windowed_pmf, mu, var, sigma, coverage
 
     # ===== Approach 1: FFT Convolution Implementation =====
     def _fft_powering_distribution(self) -> Tuple[np.ndarray, int, int, float, float, float, float]:
@@ -390,7 +485,18 @@ class App(tk.Tk):
             return
         method = self.method_var.get().strip()
 
-        if method == "FFT Powering":
+        if method == "Convolution":
+            # ---- Run exact discrete convolution ----
+            pmf, mu, var, sigma, coverage = self._convolution_exact(qmin, qmax)
+            self.result_rows = pmf
+            self.results_available = True
+            summary_text = (
+                f"Summary (Convolution - Exact)\n"
+                f"μ={mu:.6f}, σ²={var:.6f}, σ={sigma:.6f}\n"
+                f"Window: [{qmin}, {qmax}], Mass in window: {coverage*100:.2f}%\n"
+            )
+
+        elif method == "FFT Powering":
             pmf_window, qmin_out, qmax_out, mu, var, sigma, coverage = self._fft_powering_distribution()
             charges_window = list(range(qmin_out, qmax_out + 1))
             window_probs = list(pmf_window)

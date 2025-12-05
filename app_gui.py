@@ -12,9 +12,14 @@ import math
 import tkinter as tk
 from typing import Dict, List, Tuple
 from tkinter import ttk, filedialog, messagebox
+import numpy as np
 
 APP_TITLE = "Charge Variants Tool (UI Preview – Offline)"
 TOL = 1e-9
+
+def next_pow2(n: int) -> int:
+    """Return the next power of 2 >= n."""
+    return 1 << (n - 1).bit_length()
 
 DEFAULT_CHARGES_5 = [-2, -1, 0, 1, 2]
 
@@ -279,12 +284,12 @@ class App(tk.Tk):
         ttk.Label(sec, text="to", style="ToolLabel.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
         ttk.Entry(sec, textvariable=self.qmax_var, width=8).grid(row=0, column=3, sticky="w", padx=(0, 12), pady=4)
 
-        ttk.Label(sec, text="Approximation Method", style="ToolLabel.TLabel").grid(row=0, column=4, sticky="w", padx=(0, 6), pady=4)
+        ttk.Label(sec, text="Algorithm", style="ToolLabel.TLabel").grid(row=0, column=4, sticky="w", padx=(0, 6), pady=4)
         self.method_var = tk.StringVar(value="Convolution")
         ttk.Combobox(
             sec,
             textvariable=self.method_var,
-            values=["Convolution", "Moment Matching", "Placeholder Bell"],
+            values=["Convolution", "FFT Powering", "Moment Matching", "Placeholder Bell"],
             width=18,
             state="readonly"
         ).grid(row=0, column=5, sticky="ew", pady=4)
@@ -473,6 +478,139 @@ class App(tk.Tk):
             # Note: coverage before renormalization represents actual mass in window
         
         return windowed_pmf, mu, var, sigma, coverage
+
+    # ======= FFT Powering Algorithm =======
+    def _fft_powering_distribution(self) -> Tuple[np.ndarray, int, int, float, float, float, float]:
+        """
+        FFT-based convolution for charge distribution computation.
+        Returns: (pmf_window, qmin, qmax, mu, var, sigma, coverage)
+        """
+        rows = self._collect_table_rows()
+        if not rows:
+            return np.array([1.0]), -5, 5, 0.0, 0.0, 0.0, 0.0
+
+        charges = list(self.charge_cols)
+        qmin_req, qmax_req = -5, 5  # default truncation
+        try:
+            qmin_req = int(self.qmin_var.get())
+            qmax_req = int(self.qmax_var.get())
+        except Exception:
+            pass
+
+        # Compute mean/variance for summary
+        mu_total, var_total = 0.0, 0.0
+
+        # Start with delta at 0
+        total_pmf = np.array([1.0])
+        offset_total = 0  # charge corresponding to index 0 in total_pmf
+
+        for r in rows:
+            probs = [max(0.0, float(r.get(str(c), 0.0))) for c in charges]
+            s = sum(probs)
+            if s <= 0.0:
+                probs = [1.0 if c == 0 else 0.0 for c in charges]
+                s = 1.0
+            probs = [p / s for p in probs]
+
+            # mean/variance for this site
+            mu_r = sum(c * p for c, p in zip(charges, probs))
+            var_r = sum((c - mu_r) ** 2 * p for c, p in zip(charges, probs))
+            copies = max(1, int(r.get("Copies", 1)))
+            mu_total += mu_r * copies
+            var_total += var_r * copies
+
+            # FFT powering
+            min_charge, max_charge = min(charges), max(charges)
+            pmf_site = np.zeros(max_charge - min_charge + 1, dtype=np.float64)
+            for i, c in enumerate(charges):
+                pmf_site[c - min_charge] = probs[i]
+
+            # compute next power of 2 size
+            fft_size = next_pow2(len(total_pmf) + len(pmf_site) * copies - 1)
+            fft_total = np.fft.fft(total_pmf, fft_size)
+            fft_site = np.fft.fft(pmf_site, fft_size)
+            fft_site_power = fft_site ** copies
+            fft_total *= fft_site_power
+            total_conv = np.fft.ifft(fft_total).real
+            total_conv[total_conv < 0] = 0.0
+
+            # update offset
+            offset_total += min_charge * copies
+            total_pmf = total_conv
+
+        sigma_total = math.sqrt(var_total)
+        
+        # Truncate to requested window
+        idx_start = max(0, qmin_req - offset_total)
+        idx_end = min(len(total_pmf), qmax_req - offset_total + 1)
+        pmf_window = total_pmf[idx_start:idx_end]
+
+        coverage = pmf_window.sum() / total_pmf.sum() * 100 if total_pmf.sum() > 0 else 0.0
+
+        return pmf_window, qmin_req, qmax_req, mu_total, var_total, sigma_total, coverage
+
+    # ======= Data Validation with Cell Highlighting =======
+    def _validate_rows_strict(self) -> bool:
+        """
+        Strict validation: checks for missing fields and sum of charges != 1.
+        Highlights problematic rows and shows detailed error messages.
+        Returns True if all rows are valid, False otherwise.
+        """
+        missing_rows = []
+        sum_error_rows = []
+
+        for idx, item in enumerate(self.tree.get_children(), start=1):
+            vals = list(self.tree.item(item, "values"))
+
+            # Reset background
+            self.tree.item(item, tags=("even" if idx % 2 else "odd",))
+
+            # --- Check for missing fields ---
+            missing_fields = []
+            if not vals[0].strip():
+                missing_fields.append("Site")
+            if not vals[1].strip():
+                missing_fields.append("Copies")
+            for i, charge in enumerate(self.charge_cols, start=2):
+                if i >= len(vals) or not str(vals[i]).strip():
+                    missing_fields.append(f"Charge '{charge}'")
+
+            if missing_fields:
+                missing_rows.append((idx, missing_fields))
+                self.tree.item(item, tags=("missing",))
+
+            # --- Check if sum of charges is not exactly 1 ---
+            try:
+                charge_vals = [max(0.0, float(vals[i])) for i in range(2, 2 + len(self.charge_cols))]
+                s = sum(charge_vals)
+                if abs(s - 1.0) > 1e-12:  # sum != 1
+                    sum_error_rows.append((idx, s))
+                    self.tree.item(item, tags=("sum_error",))
+            except Exception:
+                pass
+
+        # --- Configure highlights ---
+        self.tree.tag_configure("missing", background="#ffcccc")
+        self.tree.tag_configure("sum_error", background="#ffe0b3")
+
+        # --- Build combined error message ---
+        messages = []
+        if missing_rows:
+            msg = "Missing fields detected:\n" + "\n".join(
+                [f"Row {r}: {', '.join(flds)}" for r, flds in missing_rows]
+            )
+            messages.append(msg)
+        if sum_error_rows:
+            msg = "Charge sum not exactly 1:\n" + "\n".join(
+                [f"Row {r}: sum={s:.6f}" for r, s in sum_error_rows]
+            )
+            messages.append(msg)
+
+        if messages:
+            messagebox.showwarning("Validation Errors", "\n\n".join(messages))
+            return False
+
+        return True
 
     # ======= Moment Matching core =======
     def _std_normal_cdf(self, x: float) -> float:
@@ -697,6 +835,12 @@ class App(tk.Tk):
             messagebox.showerror("Save Input", f"Failed to save:\n{e}")
 
     def action_compute(self) -> None:
+        """Compute PMF after validating all rows."""
+        # Strict validation first
+        if not self._validate_rows_strict():
+            self._status("Cannot compute: validation errors detected.")
+            return
+
         # Read desired range
         try:
             qmin = int(self.qmin_var.get())
@@ -732,6 +876,38 @@ class App(tk.Tk):
             # chart
             self._draw_chart()
             self._status("Computed using Convolution (exact).")
+
+        elif method == "FFT Powering":
+            # ---- Run FFT-based convolution ----
+            pmf_window, qmin_out, qmax_out, mu, var, sigma, coverage = self._fft_powering_distribution()
+            charges_window = list(range(qmin_out, qmax_out + 1))
+            window_probs = list(pmf_window)
+            
+            # Pad with zeros if pmf_window is shorter than expected
+            while len(window_probs) < len(charges_window):
+                window_probs.append(0.0)
+            
+            self.result_rows = list(zip(charges_window, window_probs))
+            self.results_available = True
+
+            # fill results table
+            for it in self.table_tree.get_children():
+                self.table_tree.delete(it)
+            for q, p in self.result_rows:
+                self.table_tree.insert("", "end", values=(q, f"{p:.12e}"))
+
+            # summary text
+            self.summary_txt.delete("1.0", tk.END)
+            self.summary_txt.insert("1.0", "Summary (FFT Powering - Strict Truncation)\n\n")
+            self.summary_txt.insert("end", f"- Detected charges: {self.charge_cols[0]} … {self.charge_cols[-1]}\n")
+            self.summary_txt.insert("end", f"- Rows (PTM sites): {len(self.tree.get_children())}\n")
+            self.summary_txt.insert("end", f"- μ = {mu:.6f}\n- σ² = {var:.6f}\n- σ = {sigma:.6f}\n")
+            self.summary_txt.insert("end", f"- Truncation range: [{qmin_out}, {qmax_out}]\n")
+            self.summary_txt.insert("end", f"- Coverage in window: {coverage:.6f}%\n")
+
+            # chart
+            self._draw_chart()
+            self._status("Computed using FFT Powering.")
 
         elif method == "Moment Matching":
             # ---- Run Gaussian moment-matching using the table ----
